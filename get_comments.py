@@ -52,7 +52,6 @@ def extract_video_id(url_or_id: str) -> str:
             if YT_ID_RE.fullmatch(candidate):
                 return candidate
 
-
     # 3) Give up
     return s
 # --------------------------------------------------------------------------
@@ -171,7 +170,6 @@ def download_comments(url, output_path, pbar, cookies_file=None):
     finally:
         pbar.update(1)
 
-
 def process_urls_threaded(urls, output_path, num_threads, cookies_file=None):
     """Manages the multithreaded processing of the video URLs."""
     if not urls:
@@ -203,15 +201,46 @@ def process_urls_threaded(urls, output_path, num_threads, cookies_file=None):
         for t in threads:
             t.join()
 
+# ---------------- NEW: utilities for channel IDs from file ----------------
+def read_channel_ids_from_file(path: str):
+    """
+    Read channel IDs from a text file, one per line.
+    Empty lines and lines starting with '#' are ignored.
+    """
+    chan_ids = []
+    with open(path, "r", encoding="utf-8") as f:
+        for line in f:
+            s = line.strip()
+            if not s or s.startswith("#"):
+                continue
+            chan_ids.append(s)
+    return chan_ids
+
+def dedupe_preserve_order(seq):
+    seen = set()
+    out = []
+    for x in seq:
+        if x not in seen:
+            out.append(x)
+            seen.add(x)
+    return out
+# --------------------------------------------------------------------------
+
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(
-        description='Download video comments from one or more YouTube channels using yt-dlp.'
+        description=(
+            'Download video comments from one or more YouTube channels using yt-dlp.\n'
+            'You can pass channels via --channel_ids and/or --channels_file (one ID per line).'
+        )
     )
     parser.add_argument(
         '--channel_ids',
         nargs='+',
-        required=True,
         help='The ID(s) of the YouTube channel(s).'
+    )
+    parser.add_argument(
+        '--channels_file', type=str,
+        help='Path to a text file containing one channel ID per line (lines starting with # are ignored).'
     )
     parser.add_argument(
         '--num_threads', type=int, default=4,
@@ -227,9 +256,27 @@ if __name__ == '__main__':
     )
 
     args = parser.parse_args()
-    
+
+    # Gather channel IDs from CLI and/or file, then dedupe while preserving order
+    combined_ids = []
+    if args.channel_ids:
+        combined_ids.extend([s.strip() for s in args.channel_ids if s and s.strip()])
+    if args.channels_file:
+        try:
+            file_ids = read_channel_ids_from_file(args.channels_file)
+            if file_ids:
+                print(f"Loaded {len(file_ids)} channel IDs from {args.channels_file}.")
+            combined_ids.extend(file_ids)
+        except Exception as e:
+            raise SystemExit(f"Failed to read --channels_file '{args.channels_file}': {e}")
+
+    # If nothing provided, show an error
+    combined_ids = dedupe_preserve_order(combined_ids)
+    if not combined_ids:
+        parser.error('You must provide --channel_ids and/or --channels_file with at least one channel ID.')
+
     root_output_path = pathlib.Path(args.output)
-    channel_ids = args.channel_ids
+    channel_ids = combined_ids
     
     # Set up the outer progress bar for channels if there are multiple
     channel_iterator = (
