@@ -8,10 +8,12 @@ from urllib.parse import urlparse, parse_qs
 import re
 from datetime import datetime
 import json
+import sys
 
 # --------------------------------------------------------------------------
 # Helper to normalize any YouTube URL (or bare ID) to the canonical 11-char ID
 YT_ID_RE = re.compile(r"^[0-9A-Za-z_-]{11}$")
+UA = "Mozilla/5.0 (X11; Ubuntu; Linux x86_64; rv:141.0) Gecko/20100101 Firefox/141.0"
 
 def extract_video_id(url_or_id: str) -> str:
     """
@@ -30,7 +32,7 @@ def extract_video_id(url_or_id: str) -> str:
         host = parsed.netloc.lower()
         path = parsed.path
 
-        # youtu.be/<id>
+        # Legacy embed case sometimes seen
         if host.endswith("googleusercontent.com"):
             if path.startswith("/youtube.com/v/"):
                 candidate = path.split("/")[3]
@@ -56,19 +58,34 @@ def extract_video_id(url_or_id: str) -> str:
     return s
 # --------------------------------------------------------------------------
 
+def atomic_write_text(final_path: pathlib.Path, text: str):
+    """
+    Write text atomically:
+      - write to <final>.partial
+      - flush + fsync
+      - os.replace to final path
+    Ensures no truncated final file on interrupts.
+    """
+    tmp_path = final_path.with_suffix(final_path.suffix + ".partial")
+    with open(tmp_path, "w", encoding="utf-8") as f:
+        f.write(text)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp_path, final_path)
+
 def get_urls_to_process(channel_id, output_folder, cookies_file=None):
     """
     Fetches all video URLs from a given channel ID, skipping those already downloaded.
     """
-    # Construct the channel URL for the 'videos' tab.
     source_url = f"https://www.youtube.com/channel/{channel_id}"
-    
+
     print(f"Fetching video list from: {source_url}")
     cmd = [
         "yt-dlp",
         "--flat-playlist",
-        "--skip-download",      # don’t download video data
-        "--print", "%(url)s",   # output one URL per line
+        "--skip-download",
+        "--print", "%(url)s",
+        "--user-agent", UA,
     ]
     if cookies_file:
         cmd += ["--cookies", cookies_file]
@@ -78,14 +95,12 @@ def get_urls_to_process(channel_id, output_folder, cookies_file=None):
         result = subprocess.run(
             cmd, capture_output=True, text=True, check=True
         )
-        all_urls = result.stdout.strip().splitlines()
+        all_urls = [u for u in result.stdout.strip().splitlines() if u]
         print(f"Found {len(all_urls)} videos in channel.")
     except subprocess.CalledProcessError as e:
         print(f"Error fetching list for channel {channel_id}: {e.stderr}")
         return []
 
-    # Build the set of IDs already present on disk for this channel
-    # This logic still works because the video ID is the first 11 characters.
     output_path = pathlib.Path(output_folder)
     downloaded_ids = {
         extract_video_id(f.name[:11])
@@ -93,7 +108,6 @@ def get_urls_to_process(channel_id, output_folder, cookies_file=None):
         if f.suffix == ".json"
     }
 
-    # Filter out any URLs whose ID is already downloaded
     urls_to_download = []
     for url in all_urls:
         vid = extract_video_id(url)
@@ -103,28 +117,54 @@ def get_urls_to_process(channel_id, output_folder, cookies_file=None):
     print(f"Found {len(urls_to_download)} new videos to process for channel {channel_id}.")
     return urls_to_download
 
+def prefetch_metadata(url, cookies_file=None):
+    """
+    Fetch metadata only (no comments) so we can read comment_count, upload_date, id.
+    Returns (comment_count or None, upload_date or None, video_id or None).
+    """
+    cmd = [
+        "yt-dlp",
+        "--skip-download",
+        "--dump-json",
+        "--user-agent", UA,
+        url,
+    ]
+    if cookies_file:
+        cmd.extend(["--cookies", cookies_file])
+
+    try:
+        result = subprocess.run(cmd, check=True, capture_output=True, text=True, encoding="utf-8")
+        info = json.loads(result.stdout)
+        return info.get("comment_count"), info.get("upload_date"), info.get("id")
+    except (subprocess.CalledProcessError, json.JSONDecodeError) as e:
+        tqdm.write(f"Prefetch metadata failed for {url}: {e}")
+        return None, None, None
+
 def download_comments(url, output_path, pbar, cookies_file=None):
     """
     Fetches YouTube comments and saves them to a JSON file.
     The filename will be in the format <videoid>_<upload_date>.json.
-    If the comments data is trivial (less than 3 bytes), the file is discarded.
+    Writes atomically and only saves if:
+      - yt-dlp succeeded and JSON parsed, and
+      - either (comment_count is missing) OR (len(comments) >= 95% of comment_count)
     """
     vid = extract_video_id(url)
-    # Belt-and-suspenders: skip if there's already a dump file for this video ID.
-    # The glob `f"{vid}_*.json"` will match any timestamp format.
+
+    # Skip if there's already a dump file for this video ID.
     if any(output_path.glob(f"{vid}_*.json")):
         pbar.update(1)
         return
 
-    # --- MODIFIED COMMAND ---
-    # Use --dump-json to get all metadata, including comments, in one go.
-    # --write-comments is still needed to trigger the comment fetching logic.
+    # Prefetch expected counts (if available)
+    expected_count, upload_date_prefetch, video_id_prefetch = prefetch_metadata(url, cookies_file=cookies_file)
+
+    # Fetch full JSON with comments
     cmd = [
         "yt-dlp",
         "--skip-download",
         "--write-comments",
         "--dump-json",
-        "--user-agent", "Mozilla/5.0 (X11; Ubuntu; Linux x86_64; rv:141.0) Gecko/20100101 Firefox/141.0",
+        "--user-agent", UA,
         url,
     ]
     if cookies_file:
@@ -132,41 +172,55 @@ def download_comments(url, output_path, pbar, cookies_file=None):
 
     try:
         result = subprocess.run(cmd, check=True, capture_output=True, text=True, encoding='utf-8')
-        
-        # --- NEW LOGIC TO PROCESS THE FULL JSON METADATA ---
+
+        # Parse the full info (with comments)
         video_info = json.loads(result.stdout)
-        
+
         comments_data = video_info.get('comments')
-        upload_date = video_info.get('upload_date') # Format: YYYYMMDD
-        video_id = video_info.get('id')
+        upload_date = video_info.get('upload_date') or upload_date_prefetch
+        video_id = video_info.get('id') or video_id_prefetch
 
-        # Proceed only if we have comments data and the required metadata
-        if comments_data and upload_date and video_id:
-            # Convert just the comments part to a JSON string to check its size
-            comments_json_str = json.dumps(comments_data, indent=4) # Using indent for readability
-            
-            # Check if the captured data is more than 3 bytes.
-            if len(comments_json_str.encode('utf-8')) > 3:
-                # Construct the filename using yt-dlp's naming pattern
-                filename = f"{video_id}_{upload_date}.json"
-                filepath = output_path / filename
+        if not (comments_data and upload_date and video_id):
+            tqdm.write(f"Skipping {url}: No comments found or missing metadata.")
+            return
 
-                # Write the comments to the final destination
-                with open(filepath, 'w', encoding='utf-8') as f:
-                    f.write(comments_json_str)
-            else:
-                tqdm.write(f"Skipping {url}: No comments found or comments are trivial.")
+        got_count = len(comments_data)
+
+        # If expected_count is known, enforce 95% threshold
+        if expected_count is not None:
+            threshold = int(0.95 * expected_count)
+            if got_count < threshold:
+                tqdm.write(
+                    f"Partial comments for {video_id} ({got_count}/{expected_count}). "
+                    f"Below 95% threshold; not saving."
+                )
+                return
         else:
-             tqdm.write(f"Skipping {url}: No comments found in metadata.")
+            tqdm.write(f"{video_id}: comment_count unavailable; saving without 95% check.")
 
+        # Construct filename and write atomically
+        filename = f"{video_id}_{upload_date}.json"
+        finalpath = output_path / filename
+
+        # Serialize comments with indentation for readability
+        comments_json_str = json.dumps(comments_data, indent=4, ensure_ascii=False)
+
+        # Avoid trivially small files
+        if len(comments_json_str.encode('utf-8')) <= 3:
+            tqdm.write(f"Skipping {url}: Comments JSON too small.")
+            return
+
+        # Atomic write to prevent partial final files
+        atomic_write_text(finalpath, comments_json_str)
 
     except subprocess.CalledProcessError as e:
-        err = e.stderr
-        # This error handling remains effective
+        err = e.stderr or str(e)
         if "comments" in err.lower():
             tqdm.write(f"Skipping {url}: comments disabled or unavailable.")
         else:
-            tqdm.write(f"yt-dlp error on {url}: {err}")
+            tqdm.write(f"yt-dlp error on {url}: {err.strip()}")
+    except json.JSONDecodeError:
+        tqdm.write(f"Skipping {url}: yt-dlp returned invalid JSON (possible interruption).")
     finally:
         pbar.update(1)
 
@@ -175,29 +229,31 @@ def process_urls_threaded(urls, output_path, num_threads, cookies_file=None):
     if not urls:
         return
 
+    output_path = pathlib.Path(output_path)
+    output_path.mkdir(parents=True, exist_ok=True)
+
     # This progress bar is for videos within a single channel
     with tqdm(total=len(urls), desc="Downloading Comments", leave=False) as pbar:
         threads = []
-        
-        for url in urls:
-            # Normalizing the URL isn't strictly necessary with the new method but is good practice.
-            video_id = extract_video_id(url)
-            normalized_url = f"https://www.youtube.com/watch?v={video_id}"
 
-            thread = Thread(
+        def spawn(url_):
+            video_id = extract_video_id(url_)
+            normalized_url = f"https://www.youtube.com/watch?v={video_id}"
+            t = Thread(
                 target=download_comments,
-                args=(normalized_url, pathlib.Path(output_path), pbar, cookies_file)
+                args=(normalized_url, output_path, pbar, cookies_file),
+                daemon=True,  # ensures abrupt exit won't leave hanging threads
             )
-            threads.append(thread)
-            thread.start()
-            
-            # Simple thread management to avoid creating too many at once
+            t.start()
+            return t
+
+        for url in urls:
+            threads.append(spawn(url))
             if len(threads) >= num_threads:
                 for t in threads:
                     t.join()
                 threads = []
-                
-        # Wait for any remaining threads to finish
+
         for t in threads:
             t.join()
 
@@ -270,36 +326,39 @@ if __name__ == '__main__':
         except Exception as e:
             raise SystemExit(f"Failed to read --channels_file '{args.channels_file}': {e}")
 
-    # If nothing provided, show an error
     combined_ids = dedupe_preserve_order(combined_ids)
     if not combined_ids:
         parser.error('You must provide --channel_ids and/or --channels_file with at least one channel ID.')
 
     root_output_path = pathlib.Path(args.output)
     channel_ids = combined_ids
-    
-    # Set up the outer progress bar for channels if there are multiple
-    channel_iterator = (
-        tqdm(channel_ids, desc="Processing Channels")
-        if len(channel_ids) > 1
-        else channel_ids
-    )
 
-    for channel_id in channel_iterator:
-        # Create a dedicated folder for the current channel
-        channel_output_path = root_output_path / channel_id
-        channel_output_path.mkdir(parents=True, exist_ok=True)
-        tqdm.write(f"\nProcessing channel: {channel_id}")
-        
-        urls_to_process = get_urls_to_process(
-            channel_id, channel_output_path, args.cookies
+    try:
+        channel_iterator = (
+            tqdm(channel_ids, desc="Processing Channels")
+            if len(channel_ids) > 1
+            else channel_ids
         )
-        
-        if urls_to_process:
-            process_urls_threaded(
-                urls_to_process, channel_output_path, args.num_threads, args.cookies
+
+        for channel_id in channel_iterator:
+            # Create a dedicated folder for the current channel
+            channel_output_path = root_output_path / channel_id
+            channel_output_path.mkdir(parents=True, exist_ok=True)
+            tqdm.write(f"\nProcessing channel: {channel_id}")
+
+            urls_to_process = get_urls_to_process(
+                channel_id, channel_output_path, args.cookies
             )
-        else:
-            tqdm.write(f"No new videos to process for {channel_id}.")
-            
-    print("\nComment download process finished.")
+
+            if urls_to_process:
+                process_urls_threaded(
+                    urls_to_process, channel_output_path, args.num_threads, args.cookies
+                )
+            else:
+                tqdm.write(f"No new videos to process for {channel_id}.")
+
+        print("\nComment download process finished.")
+    except KeyboardInterrupt:
+        # Graceful exit on Ctrl+C without leaving truncated final files
+        print("\nInterrupted by user. Exiting cleanly...", file=sys.stderr)
+        sys.exit(130)
