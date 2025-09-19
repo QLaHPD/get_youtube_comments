@@ -13,7 +13,7 @@ import sys
 # --------------------------------------------------------------------------
 # Helper to normalize any YouTube URL (or bare ID) to the canonical 11-char ID
 YT_ID_RE = re.compile(r"^[0-9A-Za-z_-]{11}$")
-UA = "Mozilla/5.0 (X11; Ubuntu; Linux x86_64; rv:141.0) Gecko/20100101 Firefox/141.0"
+UA = "Mozilla/5.0 (X11; Ubuntu; Linux x86_64; rv:142.0) Gecko/20100101 Firefox/142.0"
 
 def extract_video_id(url_or_id: str) -> str:
     """
@@ -85,7 +85,7 @@ def get_urls_to_process(channel_id, output_folder, cookies_file=None):
         "--flat-playlist",
         "--skip-download",
         "--print", "%(url)s",
-        "--user-agent", UA,
+        # "--user-agent", UA,
     ]
     if cookies_file:
         cmd += ["--cookies", cookies_file]
@@ -102,10 +102,13 @@ def get_urls_to_process(channel_id, output_folder, cookies_file=None):
         return []
 
     output_path = pathlib.Path(output_folder)
+    output_path.mkdir(parents=True, exist_ok=True)
+
+    # Consider a video "downloaded" if we already have a json file with its ID prefix
     downloaded_ids = {
         extract_video_id(f.name[:11])
         for f in output_path.iterdir()
-        if f.suffix == ".json"
+        if f.is_file() and f.suffix == ".json"
     }
 
     urls_to_download = []
@@ -126,7 +129,7 @@ def prefetch_metadata(url, cookies_file=None):
         "yt-dlp",
         "--skip-download",
         "--dump-json",
-        "--user-agent", UA,
+        # "--user-agent", UA,
         url,
     ]
     if cookies_file:
@@ -140,9 +143,125 @@ def prefetch_metadata(url, cookies_file=None):
         tqdm.write(f"Prefetch metadata failed for {url}: {e}")
         return None, None, None
 
+# ---------------- Normalization helpers (save in final schema) ----------------
+
+DEFAULTS = {
+    "id": "",
+    "parent": "",
+    "text": "",
+    "like_count": 0,
+    "author_id": "",
+    "author": "",
+    "author_is_uploader": False,
+    "author_is_verified": False,
+    "is_favorited": False,
+    "is_pinned": False,
+    "timestamp": 0,
+    "edited": False,
+}
+
+DROP_FIELDS = {
+    "author_thumbnail",
+    "author_url",
+    "_time_text",
+    "time_text",
+}
+
+def _to_bool(v):
+    if isinstance(v, bool):
+        return v
+    if isinstance(v, (int,)):
+        return v != 0
+    if isinstance(v, str):
+        return v.strip().lower() in {"true", "1", "yes", "y", "t"}
+    return False
+
+def _to_int(v):
+    if isinstance(v, bool):
+        return int(v)
+    if isinstance(v, int):
+        return v
+    if isinstance(v, float):
+        return int(v)
+    if isinstance(v, str):
+        try:
+            return int(v.strip())
+        except Exception:
+            return 0
+    return 0
+
+def _to_str(v):
+    if v is None:
+        return ""
+    if isinstance(v, str):
+        return v
+    return str(v)
+
+def detect_edited_flag(rec: dict) -> bool:
+    for k in ("_time_text", "time_text"):
+        v = rec.get(k)
+        if isinstance(v, str) and "(edited)" in v:
+            return True
+    return False
+
+def normalize_id_parent(rec: dict):
+    raw_id = _to_str(rec.get("id", ""))
+    parent = _to_str(rec.get("parent", ""))
+
+    if parent == "root":
+        # parent becomes empty string; id becomes first 26 chars or part before dot.
+        parent_out = ""
+        first = raw_id.split(".", 1)[0] if "." in raw_id else raw_id
+        id_out = first[:26] if len(first) >= 26 else first
+        return id_out, parent_out
+    else:
+        # keep parent as-is; id becomes last 22 chars or part after dot.
+        parent_out = parent
+        after = raw_id.split(".", 1)[1] if "." in raw_id else raw_id
+        id_out = after[-22:] if len(after) >= 22 else after
+        return id_out, parent_out
+
+def normalize_record(rec: dict) -> dict:
+    out = dict(DEFAULTS)
+
+    # compute edited before dropping
+    out["edited"] = detect_edited_flag(rec)
+
+    # drop unwanted fields (if present) from a local copy
+    local = {k: v for k, v in rec.items() if k not in DROP_FIELDS}
+
+    # coerce fields with defaults for missing keys
+    out["text"] = _to_str(local.get("text", out["text"]))
+    out["like_count"] = _to_int(local.get("like_count", out["like_count"]))
+    out["author_id"] = _to_str(local.get("author_id", out["author_id"]))
+    out["author"] = _to_str(local.get("author", out["author"]))
+    out["author_is_uploader"] = _to_bool(local.get("author_is_uploader", out["author_is_uploader"]))
+    out["author_is_verified"] = _to_bool(local.get("author_is_verified", out["author_is_verified"]))
+    out["is_favorited"] = _to_bool(local.get("is_favorited", out["is_favorited"]))
+    out["is_pinned"] = _to_bool(local.get("is_pinned", out["is_pinned"]))
+    out["timestamp"] = _to_int(local.get("timestamp", out["timestamp"]))
+
+    # id/parent normalization
+    new_id, new_parent = normalize_id_parent(local)
+    out["id"] = _to_str(new_id)
+    out["parent"] = _to_str(new_parent)
+
+    return out
+
+def normalize_comments_list(raw_list):
+    """
+    raw_list: list of dicts from yt-dlp's "comments" array
+    returns: list of normalized dicts in final schema
+    """
+    if not isinstance(raw_list, list):
+        return []
+    return [normalize_record(rec if isinstance(rec, dict) else {}) for rec in raw_list]
+
+# --------------------------------------------------------------------------
+
 def download_comments(url, output_path, pbar, cookies_file=None):
     """
-    Fetches YouTube comments and saves them to a JSON file.
+    Fetches YouTube comments and saves them to a JSON file in the FINAL normalized schema.
     The filename will be in the format <videoid>_<upload_date>.json.
     Writes atomically and only saves if:
       - yt-dlp succeeded and JSON parsed, and
@@ -164,7 +283,7 @@ def download_comments(url, output_path, pbar, cookies_file=None):
         "--skip-download",
         "--write-comments",
         "--dump-json",
-        "--user-agent", UA,
+        # "--user-agent", UA,
         url,
     ]
     if cookies_file:
@@ -180,7 +299,7 @@ def download_comments(url, output_path, pbar, cookies_file=None):
         upload_date = video_info.get('upload_date') or upload_date_prefetch
         video_id = video_info.get('id') or video_id_prefetch
 
-        if not (comments_data and upload_date and video_id):
+        if not (comments_data is not None and upload_date and video_id):
             tqdm.write(f"Skipping {url}: No comments found or missing metadata.")
             return
 
@@ -198,12 +317,15 @@ def download_comments(url, output_path, pbar, cookies_file=None):
         else:
             tqdm.write(f"{video_id}: comment_count unavailable; saving without 95% check.")
 
+        # Normalize to final schema here
+        normalized_comments = normalize_comments_list(comments_data)
+
         # Construct filename and write atomically
         filename = f"{video_id}_{upload_date}.json"
         finalpath = output_path / filename
 
-        # Serialize comments with indentation for readability
-        comments_json_str = json.dumps(comments_data, indent=4, ensure_ascii=False)
+        # Compact JSON; keep emojis
+        comments_json_str = json.dumps(normalized_comments, ensure_ascii=False, separators=(",", ":"))
 
         # Avoid trivially small files
         if len(comments_json_str.encode('utf-8')) <= 3:
@@ -215,7 +337,7 @@ def download_comments(url, output_path, pbar, cookies_file=None):
 
     except subprocess.CalledProcessError as e:
         err = e.stderr or str(e)
-        if "comments" in err.lower():
+        if "comments" in (err or "").lower():
             tqdm.write(f"Skipping {url}: comments disabled or unavailable.")
         else:
             tqdm.write(f"yt-dlp error on {url}: {err.strip()}")
